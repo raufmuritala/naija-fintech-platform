@@ -1,0 +1,66 @@
+name: CI — Lint & Validate
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Python lint & format check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install linting deps
+        run: pip install ruff black
+
+      - name: Run ruff
+        run: ruff check airflow/dags/ scripts/ --output-format=github
+
+      - name: Check formatting with black
+        run: black --check airflow/dags/ scripts/
+
+  validate-sql:
+    name: SQL schema syntax check
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: naija
+          POSTGRES_PASSWORD: naija123
+          POSTGRES_DB: naijabank
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply schema
+        run: |
+          PGPASSWORD=naija123 psql \
+            -h localhost -U naija -d naijabank \
+            -f sql/01_schema.sql
+        env:
+          PGPASSWORD: naija123
+
+      - name: Verify tables exist
+        run: |
+          PGPASSWORD=naija123 psql \
+            -h localhost -U naija -d naijabank \
+            -c "\dt" | grep -E "users|accounts|transactions|cards|transfers"

@@ -15,6 +15,9 @@ import os
 import logging
 from datetime import datetime, timedelta
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 import pandas as pd
 import psycopg2
 import psycopg2.extras
@@ -77,9 +80,9 @@ ENTITY_TABLES = {
             bigquery.SchemaField("account_number", "STRING"),
             bigquery.SchemaField("account_type",   "STRING"),
             bigquery.SchemaField("currency",       "STRING"),
-            bigquery.SchemaField("balance",        "NUMERIC"),
-            bigquery.SchemaField("ledger_balance", "NUMERIC"),
-            bigquery.SchemaField("daily_limit",    "NUMERIC"),
+            bigquery.SchemaField("balance",        "FLOAT"),
+            bigquery.SchemaField("ledger_balance", "FLOAT"),
+            bigquery.SchemaField("daily_limit",    "FLOAT"),
             bigquery.SchemaField("is_frozen",      "BOOLEAN"),
             bigquery.SchemaField("freeze_reason",  "STRING"),
             bigquery.SchemaField("opened_at",      "TIMESTAMP"),
@@ -108,7 +111,7 @@ ENTITY_TABLES = {
             bigquery.SchemaField("expiry_month",   "INTEGER"),
             bigquery.SchemaField("expiry_year",    "INTEGER"),
             bigquery.SchemaField("status",         "STRING"),
-            bigquery.SchemaField("daily_limit",    "NUMERIC"),
+            bigquery.SchemaField("daily_limit",    "FLOAT"),
             bigquery.SchemaField("issued_at",      "TIMESTAMP"),
             bigquery.SchemaField("blocked_at",     "TIMESTAMP"),
             bigquery.SchemaField("block_reason",   "STRING"),
@@ -154,10 +157,37 @@ def _extract_and_load(table_name: str, ds: str) -> None:
     df["_snapshot_date"] = pd.to_datetime(ds).date()
     df["_ingested_at"]   = pd.Timestamp.utcnow()
 
+    money_cols = ["balance", "ledger_balance", "daily_limit"]
+    for col in money_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    timestamp_cols = [
+        "kyc_verified_at",
+        "created_at",
+        "updated_at",
+        "opened_at",
+        "closed_at",
+        "issued_at",
+        "blocked_at",
+        "_ingested_at",
+    ]
+    for col in timestamp_cols:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.floor("us")
+
     # ── Upload Parquet to GCS ─────────────────────────────────────────────────
     gcs_path = f"raw/{table_name}/dt={ds}/{table_name}.parquet"
     buf = io.BytesIO()
-    df.to_parquet(buf, index=False, compression="snappy")
+
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    pq.write_table(
+        table,
+        buf,
+        compression="snappy",
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
+    )
     buf.seek(0)
 
     storage.Client().bucket(GCS_BUCKET).blob(gcs_path).upload_from_string(
@@ -185,7 +215,27 @@ def _extract_and_load(table_name: str, ds: str) -> None:
         job_config=job_config,
     )
     job.result()
+
+    if job.errors:
+        raise RuntimeError(f"BigQuery load errors for {table_name}: {job.errors}")
+
     logger.info(f"  Loaded {len(rows):,} rows → {table_ref}")
+
+    result = bq.query(f"""
+        SELECT COUNT(*) AS n
+        FROM `{table_ref}`
+        WHERE _snapshot_date = '{ds}'
+    """).result()
+
+    actual = next(result).n
+    expected = len(rows)
+
+    if actual != expected:
+        raise ValueError(
+            f"{table_name} row count mismatch! Postgres={expected:,}, BigQuery={actual:,}"
+        )
+
+    logger.info(f"  Validation passed — {actual:,} {table_name} rows confirmed in BigQuery")
 
 
 @dag(

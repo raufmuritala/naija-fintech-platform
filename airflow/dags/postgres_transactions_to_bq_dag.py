@@ -13,6 +13,9 @@ import os
 import logging
 from datetime import datetime, timedelta
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 import pandas as pd
 import psycopg2
 import psycopg2.extras
@@ -35,11 +38,11 @@ BQ_SCHEMA = [
     bigquery.SchemaField("transaction_id",    "STRING",    mode="REQUIRED"),
     bigquery.SchemaField("account_id",        "STRING",    mode="REQUIRED"),
     bigquery.SchemaField("transaction_type",  "STRING"),
-    bigquery.SchemaField("amount",            "NUMERIC"),
+    bigquery.SchemaField("amount",            "FLOAT"),
     bigquery.SchemaField("currency",          "STRING"),
     bigquery.SchemaField("direction",         "STRING"),
-    bigquery.SchemaField("balance_before",    "NUMERIC"),
-    bigquery.SchemaField("balance_after",     "NUMERIC"),
+    bigquery.SchemaField("balance_before",    "FLOAT"),
+    bigquery.SchemaField("balance_after",     "FLOAT"),
     bigquery.SchemaField("status",            "STRING"),
     bigquery.SchemaField("channel",           "STRING"),
     bigquery.SchemaField("narration",         "STRING"),
@@ -48,8 +51,8 @@ BQ_SCHEMA = [
     bigquery.SchemaField("counterparty_bank", "STRING"),
     bigquery.SchemaField("counterparty_acct", "STRING"),
     bigquery.SchemaField("counterparty_name", "STRING"),
-    bigquery.SchemaField("fee_amount",        "NUMERIC"),
-    bigquery.SchemaField("vat_amount",        "NUMERIC"),
+    bigquery.SchemaField("fee_amount",        "FLOAT"),
+    bigquery.SchemaField("vat_amount",        "FLOAT"),
     bigquery.SchemaField("device_id",         "STRING"),
     bigquery.SchemaField("ip_address",        "STRING"),
     bigquery.SchemaField("location_state",    "STRING"),
@@ -94,7 +97,7 @@ def on_failure_callback(context):
 Extracts all transactions created on `{{ ds }}` from the NaijaBank PostgreSQL
 source database, writes them as Parquet to GCS, then loads into BigQuery.
 
-**Idempotency**: partition decorator + WRITE_TRUNCATE — safe to re-run.
+**Idempotency**: execution-date partition + WRITE_TRUNCATE — safe to re-run.
 **Backfill**: catchup=True, max_active_runs=3.
     """,
 )
@@ -147,11 +150,11 @@ def postgres_transactions_to_bq():
                         location_state,
                         created_at,
                         updated_at,
-                        value_date
+                        DATE(created_at AT TIME ZONE 'Africa/Lagos') AS value_date
                     FROM transactions
-                    WHERE DATE(created_at AT TIME ZONE 'Africa/Lagos') = %(exec_date)s
+                    WHERE DATE(created_at AT TIME ZONE 'Africa/Lagos') = %(ds)s
                     ORDER BY created_at
-                """, {"exec_date": ds})
+                """, {"ds": ds})
 
                 rows = [dict(r) for r in cur]
 
@@ -188,8 +191,23 @@ def postgres_transactions_to_bq():
         else:
             df = pd.DataFrame(columns=[f.name for f in BQ_SCHEMA])
 
+        timestamp_cols = ["created_at", "updated_at", "_ingested_at"]
+
+        for col in timestamp_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.floor("us")
+
         buf = io.BytesIO()
-        df.to_parquet(buf, index=False, compression="snappy")
+
+        table = pa.Table.from_pandas(df, preserve_index=False)
+
+        pq.write_table(
+            table,
+            buf,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         buf.seek(0)
         data = buf.read()
 
@@ -230,7 +248,11 @@ def postgres_transactions_to_bq():
         )
 
         bq     = bigquery.Client(project=GCP_PROJECT)
-        job    = bq.load_table_from_uri(gcs_uri, f"{table_ref}${partition}", job_config=job_config)
+        job = bq.load_table_from_uri(
+            gcs_uri,
+            f"{table_ref}${partition}",
+            job_config=job_config,
+        )
         job.result()
 
         if job.errors:
@@ -242,29 +264,33 @@ def postgres_transactions_to_bq():
     @task(task_id="validate_load")
     def validate_load(load_result: dict, extract_result: dict):
         """
-        Row-count reconciliation: BigQuery must match what Postgres gave us.
-        Raises on any mismatch — prevents silent data loss going undetected.
+        Row-count reconciliation: BigQuery must match what Postgres gave us
+        for this DAG execution date.
         """
-        expected  = extract_result["row_count"]
+        expected = extract_result["row_count"]
         if expected == 0:
             logger.info("No rows expected — skipping count validation")
             return
 
+        table = load_result["bq_table"]
         partition = load_result["partition"]
-        date_str  = f"{partition[:4]}-{partition[4:6]}-{partition[6:]}"
-        bq        = bigquery.Client(project=GCP_PROJECT)
+        date_str = f"{partition[:4]}-{partition[4:6]}-{partition[6:]}"
 
-        result    = bq.query(f"""
+        bq = bigquery.Client(project=GCP_PROJECT)
+
+        result = bq.query(f"""
             SELECT COUNT(*) AS n
-            FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
-            WHERE DATE(value_date) = '{date_str}'
+            FROM `{table}`
+            WHERE value_date = '{date_str}'
         """).result()
 
         actual = next(result).n
+
         if actual != expected:
             raise ValueError(
                 f"Row count mismatch! Postgres={expected:,}, BigQuery={actual:,}"
             )
+
         logger.info(f"✅ Validation passed — {actual:,} rows confirmed in BigQuery")
 
     # ─── Task wiring ──────────────────────────────────────────────────────────

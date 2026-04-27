@@ -1,2 +1,10 @@
 # Secrets — never commit
 .env
+secrets/*.json
+
+# Airflow/runtime output
+airflow/logs/
+
+# Python cache
+__pycache__/
+*.pyc

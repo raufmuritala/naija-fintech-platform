@@ -218,8 +218,7 @@ def generate_users(n: int) -> list[dict]:
     # Second pass: assign ~30% of users a referrer
     user_ids = [u["user_id"] for u in users]
     for u in users:
-        if random.random() < 0.30:
-            u["referred_by"] = random.choice(user_ids)
+        u["referred_by"] = None
     return users
 
 

@@ -17,7 +17,7 @@ x-airflow-common: &airflow-common
     GCS_BUCKET: ${GCS_BUCKET}
     BIGQUERY_DATASET: ${BIGQUERY_DATASET}
     # Source DB
-    SOURCE_DB_CONN: postgresql+psycopg2://naija:naija123@postgres-source:5432/naijabank
+    SOURCE_DB_CONN: postgresql://naija:naija123@postgres-source:5432/naijabank
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
